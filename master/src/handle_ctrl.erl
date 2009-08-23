@@ -37,12 +37,12 @@ op("jobinfo", Query, _Json) ->
 op("parameters", Query, _Json) ->
         {value, {_, Name}} = lists:keysearch("name", 1, Query),
         {ok, MasterUrl} = application:get_env(disco_url),
-        {relo, [MasterUrl, "/", Name, "/params"]};
+        {relo, [MasterUrl, "/", disco_server:jobhome(Name), "params"]};
 
 op("rawevents", Query, _Json) ->
         {value, {_, Name}} = lists:keysearch("name", 1, Query),
         {ok, MasterUrl} = application:get_env(disco_url),
-        {relo, [MasterUrl, "/", Name, "/events"]};
+        {relo, [MasterUrl, "/", disco_server:jobhome(Name), "events"]};
 
 op("oob_get", Query, _Json) ->
         {value, {_, Name}} = lists:keysearch("name", 1, Query),
@@ -77,8 +77,9 @@ op("jobevents", Query, _Json) ->
                 false -> "";
                 {value, {_, F}} -> string:to_lower(F)
         end,
-        gen_server:call(event_server,
-                {get_job_events, Name, string:to_lower(Q), Num});
+        {ok, Ev} = gen_server:call(event_server,
+                {get_job_events, Name, string:to_lower(Q), Num}),
+        {raw, Ev};
 
 op("nodeinfo", _Query, _Json) ->
         {ok, {Available, Active}} = 
@@ -96,7 +97,9 @@ op("kill_job", _Query, Json) ->
 
 op("purge_job", _Query, Json) ->
         JobName = binary_to_list(Json),
-        gen_server:call(disco_server, {purge_job, JobName}),
+        spawn(fun() ->
+                gen_server:call(disco_server, {purge_job, JobName}, 60000)
+        end),
         {ok, <<>>};
 
 op("clean_job", _Query, Json) ->
@@ -166,6 +169,9 @@ handle(Socket, Msg) ->
         true ->
                 Json = none
         end,
+        
+        handle_job:set_disco_url(application:get_env(disco_url), Msg),
+        
         Op = lists:last(string:tokens(binary_to_list(Script), "/")),
         Reply = case op(Op, httpd:parse_query(binary_to_list(Query)), Json) of
                 {ok, Res} -> [?HTTP_HEADER, json:encode(Res)];

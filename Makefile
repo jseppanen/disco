@@ -20,15 +20,12 @@ TARGETCFG = $(DESTDIR)/$(CONFIG_DIR)
 SRC = $(wildcard $(ESRC)/*.erl)
 TARGET = $(addsuffix .beam, $(basename \
              $(addprefix $(EBIN)/, $(notdir $(SRC)))))
-BOOT = master/disco.boot
-APP = master/ebin/disco.app
 
 build: master
 
-master: $(TARGET) $(APP)
+master: $(TARGET)
 
 clean:
-	- rm $(TARGET) $(BOOT)
 	- rm -Rf master/disco.rel master/disco.script 
 	- rm -Rf pydisco/build
 	- rm -Rf pydisco/disco.egg-info
@@ -40,8 +37,7 @@ install: install-master install-pydisco install-node
 install-master: install-config master
 	install -d $(TARGETDIR)/ebin
 	install -d $(TARGETBIN)
-	install -m 0755 $(BOOT) $(TARGETDIR)
-	install -m 0755 $(APP) $(TARGETDIR)/ebin
+	install -m 0755 master/ebin/disco.app $(TARGETDIR)/ebin
 	install -m 0755 master/make-lighttpd-proxyconf.py $(TARGETDIR)
 	install -m 0755 master/disco-master $(TARGETBIN)
 
@@ -68,11 +64,6 @@ install-config:
 	$(if $(wildcard $(TARGETCFG)/disco.conf),\
 		$(info disco config already exists, skipping),\
 		install -m 0644 conf/disco.conf.example $(TARGETCFG)/disco.conf)
-
-$(APP): $(BOOT)
-
-$(BOOT):
-	(cd master; erl -pa ebin -noshell -run make_boot write_scripts)
 
 $(EBIN)/%.beam: $(ESRC)/%.erl
 	$(CC) $(OPT) -o $(EBIN) $<

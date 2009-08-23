@@ -11,12 +11,15 @@ def check_code(c, expected):
         if code != expected:
                 raise CommException(code)
 
-def download(url, data = None, redir = False):
+def download(url, data = None, redir = False, offset = 0):
         global dl_handle
         if not dl_handle:
                 dl_handle = Curl()
+        if redir:
                 dl_handle.setopt(FOLLOWLOCATION, 1)
         retry = 0
+        if offset:
+                dl_handle.setopt(RANGE, "%d-" % offset)
         while True:
                 dl_handle.setopt(URL, url)
                 outbuf = cStringIO.StringIO()
@@ -38,7 +41,12 @@ def download(url, data = None, redir = False):
                         retry += 1
 
         dl_handle.setopt(POST, 0)
-        check_code(dl_handle, 200)
+        dl_handle.setopt(FOLLOWLOCATION, 0)
+        if offset:
+                dl_handle.setopt(RANGE, "")
+                check_code(dl_handle, 206)
+        else:
+                check_code(dl_handle, 200)
         return outbuf.getvalue()
 
 class CurlConn:

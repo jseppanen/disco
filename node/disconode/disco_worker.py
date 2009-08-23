@@ -277,7 +277,7 @@ class ReduceReader:
                 msg("Starting external sort")
                 sortname = REDUCE_SORTED % this_partition()
                 ensure_path(sortname, False)
-                cmd = ["sort", "-n", "-s", "-k", "1,1", "-z",\
+                cmd = ["sort", "-n", "-k", "1,1", "-z",\
                         "-t", " ", "-o", sortname, dlname]
 
                 proc = subprocess.Popen(cmd)
@@ -289,7 +289,7 @@ class ReduceReader:
                 msg("External sort done: %s" % sortname)
                 return self.multi_file_iterator([sortname], reader =\
                         lambda fd, sze, fname:\
-                                re_reader("(.*?) (.*?)\000", fd, sze, fname))
+                                re_reader("(?s)(.*?) (.*?)\000", fd, sze, fname))
 
        
         def list_iterator(self, lst):
