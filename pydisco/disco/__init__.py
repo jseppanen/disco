@@ -20,6 +20,7 @@ chain_reader = DeprecatedFunc(func.chain_reader, "chain_reader")
 
 def job(master, name, input, fun_map = None, **kw):
         kw.update({"name": name, "input": input})
-        kw["map"] = kw.get("map", fun_map)
+        if fun_map and 'map' not in kw:
+                kw["map"] = fun_map
         clean = kw.pop("clean", True)
         return Disco(master).new_job(**kw).wait(clean = clean)
