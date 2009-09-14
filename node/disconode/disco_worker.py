@@ -1,10 +1,10 @@
 import os, subprocess, cStringIO, marshal, time, sys, cPickle
 import re, traceback, tempfile, struct, random
+
 from disco.util import\
     parse_dir, load_conf, err, data_err, msg, resultfs_enabled, load_oob
 from disco.func import re_reader, netstr_reader
-from disco.netstring import *
-from disconode.util import *
+from disconode.util import ensure_path, safe_append, write_files
 from disconode import external
 from disco import comm
 
@@ -126,8 +126,8 @@ def open_remote(input, ext_host, ext_file):
         try:
                 return comm.open_remote("http://%s%s" % (ext_host, ext_file))
         except Exception, x:
-                data_err("Can't access an external input file (%s/%s): %s"\
-                                % (ext_host, ext_file, x), x)
+                data_err("Can't access an external input file (%s%s): %s"\
+                         % (ext_host, ext_file, x), x)
 
 def connect_input(input):
         
@@ -160,7 +160,7 @@ def connect_input(input):
         else:
                 return open_remote(input, ext_host, ext_file)
 
-class MapOutput:
+class MapOutput(object):
         def __init__(self, part, params, combiner = None):
                 self.combiner = combiner
                 self.params = params
@@ -193,7 +193,7 @@ class MapOutput:
                 os.rename(self.fname + ".partial", self.fname)
         
 
-class ReduceOutput:
+class ReduceOutput(object):
         def __init__(self, params):
                 self.fname = REDUCE_OUTPUT % this_partition()
                 self.params = params
@@ -216,7 +216,7 @@ def num_cmp(x, y):
                 pass
         return cmp(x, y)
 
-class ReduceReader:
+class ReduceReader(object):
         def __init__(self, input_files, do_sort, mem_sort_limit):
                 self.inputs = []
                 part = PART_SUFFIX % this_partition()

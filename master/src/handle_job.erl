@@ -2,6 +2,8 @@
 -module(handle_job).
 -export([handle/2, set_disco_url/2]).
 
+-include_lib("kernel/include/inet.hrl").
+
 -define(OK_HEADER, "HTTP/1.1 200 OK\n"
                    "Status: 200 OK\n"
                    "Content-type: text/plain\n\n").
@@ -112,19 +114,17 @@ find_values(Msg) ->
         end.
 
 gethostname() ->
-        {ok, SecondaryHostname} = inet:gethostname(),
-        case application:get_env(disco_master_host) of
-                {ok, ""} -> SecondaryHostname;
-                {ok, Val} -> Val
-        end.
+        {ok, Hostname} = inet:gethostname(),
+        {ok, Hostent}  = inet:gethostbyname(Hostname),
+        Hostent#hostent.h_name.
 
 set_disco_url(undefined, Msg) ->
         {value, {_, SPort}} =
                 lists:keysearch(<<"SERVER_PORT">>, 1, Msg),
         {ok, Name} = application:get_env(disco_name),
-        HostN = gethostname(),
-        DiscoUrl = lists:flatten(["http://", HostN, ":",
-                binary_to_list(SPort), "/disco/master/_", Name, "/"]),
+        Hostname = gethostname(),
+        DiscoUrl = lists:flatten(["http://", Hostname, ":",
+                                  binary_to_list(SPort), "/_", Name, "/"]),
         application:set_env(disco, disco_url, DiscoUrl);
 set_disco_url(_, _) -> ok.
 
@@ -151,7 +151,7 @@ handle(Socket, Msg) ->
 
 %. 1. Basic case: Tasks to distribute, maximum number of concurrent tasks (N)
 %  not reached.
-work([{PartID, Input}|Inputs], Mode, Name, N, Max, Res) when N =< Max ->
+work([{PartID, Input}|Inputs], Mode, Name, N, Max, Res) when N < Max ->
         ok = gen_server:call(disco_server, {new_worker, 
                 {Name, PartID, Mode, [], Input}}),
         work(Inputs, Mode, Name, N + 1, Max, Res);
@@ -159,7 +159,7 @@ work([{PartID, Input}|Inputs], Mode, Name, N, Max, Res) when N =< Max ->
 % 2. Tasks to distribute but the maximum number of tasks are already running.
 % Wait for tasks to return. Note that wait_workers() may return with the same
 % number of tasks still running, i.e. N = M.
-work([_|_] = IArg, Mode, Name, N, Max, Res) when N > Max ->
+work([_|_] = IArg, Mode, Name, N, Max, Res) when N >= Max ->
         M = wait_workers(N, Res, Name, Mode),
         work(IArg, Mode, Name, M, Max, Res);
 
