@@ -7,11 +7,13 @@ Disco client
 
 .. toctree::
    :maxdepth: 1
-   
+
    core
    func
-   util
+   error
    modutil
+   schemes
+   util
 
 Runtime environment for Disco jobs
 ----------------------------------
@@ -19,7 +21,7 @@ Runtime environment for Disco jobs
 .. toctree::
    :maxdepth: 1
 
-   disco_worker
+   node/worker
 
 Utilities
 ---------

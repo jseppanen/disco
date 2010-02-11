@@ -1,477 +1,449 @@
-import sys, re, os, marshal, modutil, time, types, cPickle, cStringIO, random
-from disco import func, util, comm
-from disco.comm import json
-from disco.error import DiscoError, JobException
+import sys, re, os, modutil, time, types, cPickle, cStringIO, random
+
+from disco import func, util
+from disco.comm import download, json
+from disco.error import DiscoError, JobError, CommError
 from disco.eventmonitor import EventMonitor
-from disco.netstring import encode_netstring_fd, decode_netstring_fd
+from disco.netstring import encode_netstring_fd, encode_netstring_str, decode_netstring_fd
+from disco.task import Task
 
 class Params(object):
-        def __init__(self, **kwargs):
-                self._state = {}
-                for k, v in kwargs.iteritems():
-                        setattr(self, k, v)
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
-        def __setattr__(self, k, v):
-                if k[0] == '_':
-                        self.__dict__[k] = v
-                        return
-                st_v = v
-                st_k = "n_" + k
-                try:
-                        st_v = marshal.dumps(v.func_code)
-                        st_k = "f_" + k
-                except AttributeError:
-                        pass
-                self._state[st_k] = st_v
-                self.__dict__[k] = v
+    def __getstate__(self):
+        return dict((k, util.pack(v))
+            for k, v in self.__dict__.iteritems()
+                if not k.startswith('_'))
 
-        def __getstate__(self):
-                return self._state
-
-        def __setstate__(self, state):
-                self._state = {}
-                for k, v in state.iteritems():
-                        if k.startswith('f_'):
-                                t = lambda x: x
-                                t.func_code = marshal.loads(v)
-                                v = t
-                        self.__dict__[k[2:]] = v
+    def __setstate__(self, state):
+        for k, v in state.iteritems():
+            self.__dict__[k] = util.unpack(v)
 
 class Stats(object):
-        def __init__(self, prof_data):
-                self.stats = marshal.loads(prof_data)
-        def create_stats(self):
-                pass
+    def __init__(self, prof_data):
+        import marshal
+        self.stats = marshal.loads(prof_data)
+
+    def create_stats(self):
+        pass
+
+class Continue(Exception):
+    pass
 
 class Disco(object):
-        def __init__(self, host):
-                self.host = "http://" + util.disco_host(host)[7:]
+    def __init__(self, host):
+        self.host = util.disco_host(host)
 
-        def request(self, url, data = None, redir = False, offset = 0):
-                try:
-                        return comm.download(self.host + url, data = data, redir = redir, offset = offset)
-                except KeyboardInterrupt:
-                        raise
-                except Exception, e:
-                        raise DiscoError('Got %s, make sure disco master is running at %s' % (e, self.host))
+    def request(self, url, data = None, redir = False, offset = 0):
+        try:
+            return download(self.host + url, data = data, redir = redir, offset = offset)
+        except CommError, e:
+            raise DiscoError("Got %s, make sure disco master is running at %s" % (e, self.host))
 
-        def nodeinfo(self):
-                return json.loads(self.request("/disco/ctrl/nodeinfo"))
+    def get_config(self):
+        return json.loads(self.request('/disco/ctrl/load_config_table'))
 
-        def joblist(self):
-                return json.loads(self.request("/disco/ctrl/joblist"))
+    def set_config(self, config):
+        response = json.loads(self.request('/disco/ctrl/save_config_table', json.dumps(config)))
+        if response != 'table saved!':
+            raise DiscoError(response)
 
-        def oob_get(self, name, key):
-                return util.load_oob(self.host, name, key)
+    config = property(get_config, set_config)
 
-        def oob_list(self, name):
-                r = self.request("/disco/ctrl/oob_list?name=%s" % name,
-                        redir = True)
-                return json.loads(r)
+    def nodeinfo(self):
+        return json.loads(self.request('/disco/ctrl/nodeinfo'))
 
-        def profile_stats(self, name, mode = ""):
-                import pstats
-                if mode:
-                        prefix = "profile-%s-" % mode
-                else:
-                        prefix = "profile-"
-                f = [s for s in self.oob_list(name) if s.startswith(prefix)]
-                if not f:
-                        raise JobException("No profile data", self.host, name)
+    def joblist(self):
+        return json.loads(self.request("/disco/ctrl/joblist"))
 
-                stats = pstats.Stats(Stats(self.oob_get(name, f[0])))
-                for s in f[1:]:
-                        stats.add(Stats(self.oob_get(name, s)))
-                return stats
+    def blacklist(self, node):
+        self.request('/disco/ctrl/blacklist', '"%s"' % node)
+    
+    def whitelist(self, node):
+        self.request('/disco/ctrl/whitelist', '"%s"' % node)
 
-        def new_job(self, **kwargs):
-                return Job(self, **kwargs)
+    def oob_get(self, name, key):
+        try:
+            return util.load_oob(self.host, name, key)
+        except CommError, e:
+            if e.http_code == 404:
+                raise DiscoError("Unknown key or job name")
+            raise
 
-        def kill(self, name):
-                self.request("/disco/ctrl/kill_job", '"%s"' % name)
+    def oob_list(self, name):
+        r = self.request("/disco/ctrl/oob_list?name=%s" % name, redir=True)
+        return json.loads(r)
 
-        def clean(self, name):
-                self.request("/disco/ctrl/clean_job", '"%s"' % name)
+    def profile_stats(self, name, mode=''):
+        prefix = 'profile-%s' % mode
+        f = [s for s in self.oob_list(name) if s.startswith(prefix)]
+        if not f:
+            raise JobError("No profile data", self.host, name)
 
-        def purge(self, name):
-                self.request("/disco/ctrl/purge_job", '"%s"' % name)
+        import pstats
+        stats = pstats.Stats(Stats(self.oob_get(name, f[0])))
+        for s in f[1:]:
+            stats.add(Stats(self.oob_get(name, s)))
+        return stats
 
-        def jobspec(self, name):
-                r = self.request("/disco/ctrl/parameters?name=%s" % name,
-                                 redir = True)
-                return decode_netstring_fd(cStringIO.StringIO(r))
+    def new_job(self, **kwargs):
+        return Job(self, **kwargs)
 
-        def events(self, name, offset = 0):
-                def event_iter(events):
-                        offs = offset
-                        lines = events.splitlines()
-                        for i, l in enumerate(lines):
-                                offs += len(l) + 1
-                                if not len(l):
-                                        continue
-                                try:
-                                        ent = tuple(json.loads(l))
-                                except ValueError:
-                                        break
-                                # HTTP range request doesn't like empty ranges:
-                                # Let's ensure that at least the last newline
-                                # is always retrieved.
-                                if i == len(lines) - 1:
-                                        offs -= 1
-                                yield offs, ent
+    def kill(self, name):
+        self.request('/disco/ctrl/kill_job', '"%s"' % name)
 
-                r = self.request("/disco/ctrl/rawevents?name=%s" % name,
-                                 redir = True, offset = offset)
+    def clean(self, name):
+        self.request('/disco/ctrl/clean_job', '"%s"' % name)
 
-                if len(r) < 2:
-                        return []
-                else:
-                        return event_iter(r)
+    def purge(self, name):
+        self.request('/disco/ctrl/purge_job', '"%s"' % name)
 
-        def results(self, jobspec, timeout = 2000):
-                jobspecifier = JobSpecifier(jobspec)
-                data         = json.dumps([timeout, list(jobspecifier.jobnames)])
-                results      = json.loads(self.request("/disco/ctrl/get_results", data))
+    def jobspec(self, name):
+        r = self.request('/disco/ctrl/parameters?name=%s' % name, redir=True)
+        return decode_netstring_fd(cStringIO.StringIO(r))
 
-                if type(jobspec) == str:
-                        return results[0][1]
+    def events(self, name, offset = 0):
+        def event_iter(events):
+            offs = offset
+            lines = events.splitlines()
+            for i, line in enumerate(lines):
+                if len(line):
+                    offs += len(line) + 1
+                    try:
+                        event = tuple(json.loads(line))
+                    except ValueError:
+                        break
+                    # HTTP range request doesn't like empty ranges:
+                    # Let's ensure that at least the last newline
+                    # is always retrieved.
+                    #if i == len(lines) - 1 and\
+                    #    events.endswith("\n"):
+                    #    offs -= 1
+                    yield offs, event
+        try:
+            r = self.request("/disco/ctrl/rawevents?name=%s" % name,
+                     redir = True,
+                     offset = offset)
+        except Exception, x:
+            return []
 
-                others, active = [], []
-                for result in results:
-                        if result[1][0] == 'active':
-                                active.append(result)
-                        else:
-                                others.append(result)
-                return others, active
+        if len(r) < 2:
+            return []
+        return event_iter(r)
 
-        def jobinfo(self, name):
-                jobinfo = self.request("/disco/ctrl/jobinfo?name=%s" % name)
-                if jobinfo:
-                        return json.loads(jobinfo)
+    def results(self, jobspec, timeout = 2000):
+        jobspecifier = JobSpecifier(jobspec)
+        data     = json.dumps([timeout, list(jobspecifier.jobnames)])
+        results      = json.loads(self.request("/disco/ctrl/get_results", data))
 
-        def wait(self, name, show = None, poll_interval = 2, timeout = None, clean = False):
-                event_monitor = EventMonitor(show, disco=self, name=name)
-                start_time    = time.time()
-                while True:
-                        status, results = self.results(name, timeout = poll_interval * 1000)
-                        event_monitor.refresh()
-                        if status == 'ready':
-                                if clean:
-                                        self.clean(name)
-                                return results
-                        if status != 'active':
-                                raise JobException("Job status %s" % status, self.host, name)
-                        if timeout and time.time() - start_time > timeout:
-                                raise JobException("Timeout", self.host, name)
+        if type(jobspec) == str:
+            return results[0][1]
+
+        others, active = [], []
+        for result in results:
+            if result[1][0] == 'active':
+                active.append(result)
+            else:
+                others.append(result)
+        return others, active
+
+    def jobinfo(self, name):
+        return json.loads(self.request("/disco/ctrl/jobinfo?name=%s" % name))
+
+    def check_results(self, name, start_time, timeout):
+        status, results = self.results(name, timeout=timeout)
+        if status == 'ready':
+            return results
+        if status != 'active':
+            raise JobError("Job status %s" % status, self.host, name)
+        if timeout and time.time() - start_time > timeout:
+            raise JobError("Timeout", self.host, name)
+        raise Continue()
+
+    def wait(self, name, show = None, poll_interval = 2, timeout = None, clean = False):
+        event_monitor = EventMonitor(show, disco=self, name=name)
+        start_time    = time.time()
+        while True:
+            event_monitor.refresh()
+            try:
+                return self.check_results(name, start_time, poll_interval * 1000)
+            except Continue:
+                continue
+            finally:
+                if clean:
+                    self.clean(name)
+                event_monitor.refresh()
 
 class JobSpecifier(list):
-        def __init__(self, jobspec):
-                super(JobSpecifier, self).__init__([jobspec]
-                        if type(jobspec) is str else jobspec)
+    def __init__(self, jobspec):
+        super(JobSpecifier, self).__init__([jobspec]
+            if type(jobspec) is str else jobspec)
 
-        @property
-        def jobnames(self):
-                for job in self:
-                        if type(job) is str:
-                                yield job
-                        elif type(job) is list:
-                                yield job[0]
-                        else:
-                                yield job.name
+    @property
+    def jobnames(self):
+        for job in self:
+            if type(job) is str:
+                yield job
+            elif type(job) is list:
+                yield job[0]
+            else:
+                yield job.name
 
-        def __str__(self):
-                return '{%s}' % ', '.join(self.jobnames)
+    def __str__(self):
+        return '{%s}' % ', '.join(self.jobnames)
 
 class Job(object):
 
-        funs = ["map", "map_init", "reduce_init", "map_reader", "map_writer",\
-                "reduce_reader", "reduce_writer", "reduce", "partition",\
-                "combiner"]
+    funs = ["map", "map_init", "reduce_init", "map_reader", "map_writer",\
+        "reduce_reader", "reduce_writer", "reduce", "partition",\
+        "combiner", "reduce_input_stream", "reduce_output_stream",\
+        "map_input_stream", "map_output_stream"]
 
-        defaults = {"name": None,
-                    "map": None,
-                    "input": None,
-                    "map_init": None,
-                    "reduce_init": None,
-                    "map_reader": func.map_line_reader,
-                    "map_writer": func.netstr_writer,
-                    "reduce_reader": func.netstr_reader,
-                    "reduce_writer": func.netstr_writer,
-                    "reduce": None,
-                    "partition": func.default_partition,
-                    "combiner": None,
-                    "nr_maps": None,
-                    "nr_reduces": None,
-                    "sort": False,
-                    "params": Params(),
-                    "mem_sort_limit": 256 * 1024**2,
-                    "ext_params": None,
-                    "status_interval": 100000,
-                    "required_files": [],
-                    "required_modules": [],
-                    "profile": False}
+    defaults = {"name": None,
+            "map": None,
+            "input": None,
+            "map_init": None,
+            "reduce_init": None,
+            "map_reader": func.map_line_reader,
+            "map_writer": func.netstr_writer,
+            "map_input_stream": None,
+            "map_output_stream": None,
+            "reduce_reader": func.netstr_reader,
+            "reduce_writer": func.netstr_writer,
+            "reduce_input_stream": None,
+            "reduce_output_stream": None,
+            "reduce": None,
+            "partition": func.default_partition,
+            "combiner": None,
+            "nr_maps": None,
+            "scheduler": {},
+#XXX: nr_reduces default has changed!
+            "nr_reduces": 1,
+            "sort": False,
+            "params": Params(),
+            "mem_sort_limit": 256 * 1024**2,
+            "ext_params": None,
+            "status_interval": 100000,
+            "required_files": [],
+            "required_modules": [],
+            "profile": False}
 
-        def __init__(self, master, **kwargs):
-                self.master = master
-                if "name" not in kwargs:
-                        raise DiscoError("Argument name is required")
-                if re.search("\W", kwargs["name"]):
-                        raise DiscoError("Only characters in [a-zA-Z0-9_] "\
-                              "are allowed in the job name")
-                self.name = "%s@%d" % (kwargs["name"], int(time.time()))
-                self._run(**kwargs)
+    mapreduce_functions = ("map_init",
+                   "map_reader",
+                   "map",
+                   "map_writer",
+                   "partition",
+                   "combiner",
+                   "reduce_init",
+                   "reduce_reader",
+                   "reduce",
+                   "reduce_writer")
 
-        def __getattr__(self, name):
-                def r(f):
-                        def g(*args, **kw):
-                                return f(*tuple([self.name] + list(args)), **kw)
-                        return g
-                if name in ["kill", "clean", "purge", "jobspec", "results",
-                            "jobinfo", "wait", "oob_get", "oob_list",
-                            "profile_stats", "events"]:
-                        return r(getattr(self.master, name))
-                raise AttributeError("%s not found" % name)
+    proxy_functions = ("kill",
+               "clean",
+               "purge",
+               "jobspec",
+               "results",
+               "jobinfo",
+               "wait",
+               "oob_get",
+               "oob_list",
+               "profile_stats",
+               "events")
 
-        def _run(self, **kw):
-                d = lambda x: kw.get(x, Job.defaults[x])
+    def __init__(self, master, name='', **kwargs):
+        self.master = master
+        self.name   = name
+        self._run(**kwargs)
 
-                # -- check parameters --
+    def __getattr__(self, attr):
+        if attr in self.proxy_functions:
+            from functools import partial
+            return partial(getattr(self.master, attr), self.name)
+        raise AttributeError("%r has no attribute %r" % (self, attr))
 
-                # Backwards compatibility
-                # (fun_map == map, input_files == input)
-                if "fun_map" in kw:
-                        kw["map"] = kw["fun_map"]
+    def pack_stack(self, kw, req, stream):
+        if stream in kw:
+            req[stream] = encode_netstring_str((f.func_name, util.pack(f))
+                               for f in util.iterify(kw[stream]))
 
-                if "input_files" in kw:
-                        kw["input"] = kw["input_files"]
+    def _run(self, **kwargs):
+        jobargs = util.DefaultDict(self.defaults.__getitem__, kwargs)
 
-                if "chunked" in kw:
-                        raise DiscoError("Argument 'chunked' is deprecated")
+        # -- check parameters --
 
-                if not "input" in kw:
-                        raise DiscoError("input is required")
+        # Backwards compatibility
+        # (fun_map == map, input_files == input)
+        if "fun_map" in kwargs:
+            kwargs["map"] = kwargs["fun_map"]
 
-                if not ("map" in kw or "reduce" in kw):
-                        raise DiscoError("Specify map and/or reduce")
+        if "input_files" in kwargs:
+            kwargs["input"] = kwargs["input_files"]
 
-                for p in kw:
-                        if p not in Job.defaults:
-                                raise DiscoError("Unknown argument: %s" % p)
+        if "chunked" in kwargs:
+            raise DeprecationWarning("Argument 'chunked' is deprecated")
 
-                inputs = kw["input"]
+        if "nr_maps" in kwargs:
+            sys.stderr.write("Warning: nr_maps is deprecated. "
+                     "Use scheduler = {'max_cores': N} instead.\n")
+            sched = jobargs["scheduler"].copy()
+            if "max_cores" not in sched:
+                sched["max_cores"] = int(jobargs["nr_maps"])
+            jobargs["scheduler"] = sched
 
-                # -- initialize request --
+        if not "input" in kwargs:
+            raise DiscoError("Argument input is required")
 
-                req = {"name": self.name,
-                       "version": ".".join(map(str, sys.version_info[:2])),
-                       "params": cPickle.dumps(d("params"), cPickle.HIGHEST_PROTOCOL),
-                       "sort": str(int(d("sort"))),
-                       "mem_sort_limit": str(d("mem_sort_limit")),
-                       "status_interval": str(d("status_interval")),
-                       "profile": str(int(d("profile")))}
+        if not ("map" in kwargs or "reduce" in kwargs):
+            raise DiscoError("Specify map and/or reduce")
 
-                # -- required modules --
+        for p in kwargs:
+            if p not in Job.defaults:
+                raise DiscoError("Unknown argument: %s" % p)
 
-                if "required_modules" in kw:
-                        rm = kw["required_modules"]
-                else:
-                        funlist = []
-                        for f in Job.funs:
-                                df = d(f)
-                                if type(df) == types.FunctionType:
-                                        funlist.append(df)
-                                elif type(df) == list:
-                                        funlist += df
-                        rm = modutil.find_modules(funlist)
-                send_mod = []
-                imp_mod = []
-                for mod in rm:
-                        if type(mod) == tuple:
-                                send_mod.append(mod[1])
-                                mod = mod[0]
-                        imp_mod.append(mod)
+        input = kwargs["input"]
 
-                req["required_modules"] = " ".join(imp_mod)
-                rf = util.pack_files(send_mod)
+        # -- initialize request --
 
-                # -- required files --
+        request = {"prefix": self.name,
+               "version": ".".join(map(str, sys.version_info[:2])),
+               "params": cPickle.dumps(jobargs['params'], cPickle.HIGHEST_PROTOCOL),
+               "sort": str(int(jobargs['sort'])),
+               "mem_sort_limit": str(jobargs['mem_sort_limit']),
+               "status_interval": str(jobargs['status_interval']),
+               "profile": str(int(jobargs['profile']))}
 
-                if "required_files" in kw:
-                        if type(kw["required_files"]) == dict:
-                                rf.update(kw["required_files"])
-                        else:
-                                rf.update(util.pack_files(\
-                                        kw["required_files"]))
-                if rf:
-                        req["required_files"] = marshal.dumps(rf)
+        # -- required modules --
 
-                # -- map --
+        if 'required_modules' in kwargs:
+            rm = kwargs['required_modules']
+        else:
+            functions = util.flatten(util.iterify(jobargs[f])
+                         for f in self.mapreduce_functions)
+            rm = modutil.find_modules([f for f in functions\
+                if callable(f)])
 
-                if "map" in kw:
-                        if type(kw["map"]) == dict:
-                                req["ext_map"] = marshal.dumps(kw["map"])
-                        else:
-                                req["map"] = marshal.dumps(kw["map"].func_code)
+        send_mod = []
+        imp_mod = []
+        for mod in rm:
+            if type(mod) == tuple:
+                send_mod.append(mod[1])
+                mod = mod[0]
+            imp_mod.append(mod)
 
-                        if "map_init" in kw:
-                                req["map_init"] = marshal.dumps(\
-                                        kw["map_init"].func_code)
+        request["required_modules"] = " ".join(imp_mod)
+        rf = util.pack_files(send_mod)
 
-                        req["map_reader"] =\
-                                marshal.dumps(d("map_reader").func_code)
-                        req["map_writer"] =\
-                                marshal.dumps(d("map_writer").func_code)
-                        req["partition"] =\
-                                marshal.dumps(d("partition").func_code)
+        # -- input & output streams --
 
-                        if "combiner" in kw:
-                                req["combiner"] =\
-                                        marshal.dumps(kw["combiner"].func_code)
+        for stream in ["map_input_stream", "map_output_stream",
+                   "reduce_input_stream", "reduce_output_stream"]:
+            self.pack_stack(kwargs, request, stream)
 
-                        parsed_inputs = []
-                        for inp in inputs:
-                                if type(inp) == list:
-                                        parsed_inputs.append(
-                                                "\n".join(reversed(inp)))
-                                elif inp.startswith("dir://"):
-                                        parsed_inputs += util.parse_dir(inp)
-                                else:
-                                        parsed_inputs.append(inp)
-                        inputs = parsed_inputs
+        # -- required files --
 
-                        if "nr_maps" not in kw or kw["nr_maps"] > len(inputs):
-                                nr_maps = len(inputs)
-                        else:
-                                nr_maps = kw["nr_maps"]
+        if "required_files" in kwargs:
+            if isinstance(kwargs["required_files"], dict):
+                rf.update(kwargs["required_files"])
+            else:
+                rf.update(util.pack_files(\
+                    kwargs["required_files"]))
+        if rf:
+            request["required_files"] = util.pack(rf)
 
-                # -- only reduce --
+        # -- scheduler --
 
-                else:
-                        nr_maps = 0
-                        ext_inputs = []
-                        red_inputs = []
-                        for inp in inputs:
-                                if type(inp) == list:
-                                        raise DiscoError("Reduce doesn't "\
-                                                "accept redundant inputs")
-                                elif inp.startswith("dir://"):
-                                        if inp.endswith(".txt"):
-                                                ext_inputs.append(inp)
-                                        else:
-                                                red_inputs.append(inp)
-                                else:
-                                        ext_inputs.append(inp)
+        sched = jobargs["scheduler"]
+        sched_keys = ["max_cores", "force_local", "force_remote"]
 
-                        if ext_inputs and red_inputs:
-                                raise DiscoError("Can't mix partitioned "\
-                                        "inputs with other inputs")
-                        elif red_inputs:
-                                q = lambda x: int(x.split(":")[-1]) + 1
-                                nr_red = q(red_inputs[0])
-                                for x in red_inputs:
-                                        if q(x) != nr_red:
-                                                raise DiscoError(\
-                                                "Number of partitions must "\
-                                                "match in all inputs")
-                                n = d("nr_reduces") or nr_red
-                                if n != nr_red:
-                                        raise DiscoError(
-                                        "Specified nr_reduces = %d but "\
-                                        "number of partitions in the input "\
-                                        "is %d" % (n, nr_red))
-                                kw["nr_reduces"] = nr_red
-                                inputs = red_inputs
-                        elif d("nr_reduces") != 1:
-                                raise DiscoError("nr_reduces must be 1 when "\
-                                        "using non-partitioned inputs "\
-                                        "without the map phase")
-                        else:
-                                inputs = ext_inputs
+        if "max_cores" not in sched:
+            sched["max_cores"] = 2**31
+        elif sched["max_cores"] < 1:
+            raise DiscoError("max_cores must be >= 1")
 
-                # shuffle fixes a pathological case in the fifo scheduler:
-                # if inputs for a node are consequent, data locality will be
-                # lost after K inputs where K is the number of cores.
-                # Randomizing the order of inputs makes this pathological case
-                # unlikely. This issue will be fixed in the new scheduler.
-                random.shuffle(inputs)
+        for k in sched_keys:
+            if k in sched:
+                request["sched_" + k] = str(sched[k])
 
-                req["input"] = " ".join(inputs)
-                req["nr_maps"] = str(nr_maps)
+        # -- map --
 
-                if "ext_params" in kw:
-                        if type(kw["ext_params"]) == dict:
-                                req["ext_params"] =\
-                                        encode_netstring_fd(kw["ext_params"])
-                        else:
-                                req["ext_params"] = kw["ext_params"]
+        if 'map' in kwargs:
+            k = 'ext_map' if isinstance(kwargs['map'], dict) else 'map'
+            request[k] = util.pack(kwargs['map'])
 
-                # -- reduce --
+            for function_name in ('map_init',
+                          'map_reader',
+                          'map_writer',
+                          'partition',
+                          'combiner'):
+                function = jobargs[function_name]
+                if function:
+                    request[function_name] = util.pack(function)
 
-                nr_reduces = d("nr_reduces")
-                if "reduce" in kw:
-                        if type(kw["reduce"]) == dict:
-                                req["ext_reduce"] = marshal.dumps(kw["reduce"])
-                                req["reduce"] = ""
-                        else:
-                                req["reduce"] = marshal.dumps(
-                                        kw["reduce"].func_code)
-                        nr_reduces = nr_reduces or min(max(nr_maps / 2, 1), 100)
+            def inputlist(input):
+                if hasattr(input, '__iter__'):
+                    return ['\n'.join(reversed(list(input)))]
+                return util.urllist(input)
+            input = [e for i in input for e in inputlist(i)]
 
-                        req["reduce_reader"] =\
-                                marshal.dumps(d("reduce_reader").func_code)
-                        req["reduce_writer"] =\
-                                marshal.dumps(d("reduce_writer").func_code)
+        # -- only reduce --
 
-                        if "reduce_init" in kw:
-                                req["reduce_init"] = marshal.dumps(\
-                                        kw["reduce_init"].func_code)
-                else:
-                        nr_reduces = nr_reduces or 0
+        else:
+            # XXX: Check for redundant inputs, external &
+            # partitioned inputs
+            input = [url for i in input for url in util.urllist(i)]
 
-                req["nr_reduces"] = str(nr_reduces)
+        request['input'] = ' '.join(input)
 
-                # -- encode and send the request --
+        if 'ext_params' in kwargs:
+            e = kwargs['ext_params']
+            request['ext_params'] = encode_netstring_fd(e)\
+                if isinstance(e, dict) else e
 
-                self.msg = encode_netstring_fd(req)
-                reply = self.master.request("/disco/job/new", self.msg)
+        # -- reduce --
 
-                if reply != "job started":
-                        raise DiscoError("Failed to start a job. Server replied: " + reply)
+        nr_reduces = jobargs['nr_reduces']
+        if 'reduce' in kwargs:
+            k = 'ext_reduce' if isinstance(kwargs['reduce'], dict) else 'reduce'
+            request[k] = util.pack(kwargs['reduce'])
 
+            for function_name in ('reduce_reader', 'reduce_writer', 'reduce_init'):
+                function = jobargs[function_name]
+                if function:
+                    request[function_name] = util.pack(function)
 
+        request['nr_reduces'] = str(nr_reduces)
 
-def result_iterator(results, notifier = None,\
-        proxy = None, reader = func.netstr_reader):
+        # -- encode and send the request --
 
-        res = []
-        for dir_url in results:
-                if dir_url.startswith("dir://"):
-                        res += util.parse_dir(dir_url, proxy)
-                else:
-                        res.append(dir_url)
+        reply = self.master.request("/disco/job/new", encode_netstring_fd(request))
 
-        x, x, root = util.load_conf()
+        if not reply.startswith('job started:'):
+            raise DiscoError("Failed to start a job. Server replied: " + reply)
+        self.name = reply.split(':', 1)[1]
 
-        for url in res:
-                if url.startswith("file://"):
-                        fname = url[7:]
-                        fd = file(fname)
-                        sze = os.stat(fname).st_size
-                elif url.startswith("disco://"):
-                        host, fname = url[8:].split("/", 1)
-                        url = util.proxy_url(proxy, fname, host)
-                        if util.resultfs_enabled:
-                                f = "%s/data/%s" % (root, fname)
-                                fd = file(f)
-                                sze = os.stat(f).st_size
-                        else:
-                                sze, fd = comm.open_remote(url)
-                else:
-                        raise JobException("Invalid result url: %s" % url)
+def result_iterator(results,
+            notifier = None,
+            reader = func.netstr_reader,
+            input_stream = [func.map_input_stream],
+            params = None):
 
-                if notifier:
-                        notifier(url)
+    task = Task(result_iterator = True)
+    for fun in input_stream:
+        fun.func_globals.setdefault("Task", task)
 
-                for x in reader(fd, sze, fname):
-                        yield x
+    res = []
+    res = [url for r in results for url in util.urllist(r)]
+
+    for url in res:
+        fd = sze = None
+        for fun in input_stream:
+            fd, sze, url = fun(fd, sze, url, params)
+
+        if notifier:
+            notifier(url)
+
+        for x in reader(fd, sze, url):
+            yield x
 
