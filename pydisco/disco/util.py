@@ -51,7 +51,8 @@ def unpack(string):
     try:
         return cPickle.loads(string)
     except Exception:
-        return FunctionType(marshal.loads(string), {})
+        return FunctionType(marshal.loads(string),
+                            {'__builtins__': __builtins__})
 
 def urlsplit(url):
     scheme, rest = url.split('://', 1) if '://' in url  else ('file', url)
