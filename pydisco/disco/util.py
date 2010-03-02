@@ -42,6 +42,8 @@ def rapply(iterable, fn):
 
 def pack(object):
     if hasattr(object, 'func_code'):
+        if object.func_closure!=None:
+            raise TypeError('Function must not have closures: %s'%object.func_name)
         return marshal.dumps(object.func_code)
     return cPickle.dumps(object)
 
