@@ -45,7 +45,7 @@ def pack(object):
         if object.func_closure!=None:
             raise TypeError('Function must not have closures: %s'%object.func_name)
         return marshal.dumps(object.func_code)
-    return cPickle.dumps(object)
+    return cPickle.dumps(object, cPickle.HIGHEST_PROTOCOL)
 
 def unpack(string):
     try:
