@@ -22,10 +22,9 @@ def download(url, data = None, redir = False, offset = 0):
     dl_handle.setopt(TIMEOUT, TRANSFER_TIMEOUT)
     if redir:
         dl_handle.setopt(FOLLOWLOCATION, 1)
-    retry = 0
     if offset:
         dl_handle.setopt(RANGE, "%d-" % offset)
-    while True:
+    for retry in range(MAX_RETRIES):
         dl_handle.setopt(URL, str(url))
         outbuf = cStringIO.StringIO()
         dl_handle.setopt(WRITEFUNCTION, outbuf.write)
@@ -36,22 +35,24 @@ def download(url, data = None, redir = False, offset = 0):
             dl_handle.setopt(HTTPHEADER, ["Expect:"])
             dl_handle.setopt(POST, 1)
         try:
-            dl_handle.perform()
-            break
-        except PyCurlError, e:
-            if retry == MAX_RETRIES:
+            try:
+                dl_handle.perform()
+            except PyCurlError, e:
+                raise CommError(dl_handle.errstr(), url)
+            if offset:
+                dl_handle.setopt(RANGE, "")
+                check_code(dl_handle, 206, url)
+            else:
+                check_code(dl_handle, 200, url)
+            return outbuf.getvalue()
+        except CommError, e:
+            if retry == MAX_RETRIES-1:
                 raise CommError("Download failed "
                         "after %d attempts: %s" %
-                        (MAX_RETRIES, dl_handle.errstr()), url)
+                        (MAX_RETRIES, e.msg), url)
             dl_handle.setopt(FRESH_CONNECT, 1)
-            retry += 1
-
-    if offset:
-        dl_handle.setopt(RANGE, "")
-        check_code(dl_handle, 206, url)
-    else:
-        check_code(dl_handle, 200, url)
-    return outbuf.getvalue()
+            time.sleep(1.0)
+    raise CommError("Download failed") # shouldn't get here
 
 class CurlConn:
     def __init__(self, url, handle = None, expect = 200):
@@ -61,26 +62,30 @@ class CurlConn:
             self.handle = Curl()
         self.url = url
 
-        for i in range(MAX_RETRIES):
-            self.init_handle(url)
-            self.perform()
-            x, succ, fail = self.multi.info_read(1)
-            if not fail:
-                break
-            self.handle = Curl()
-            time.sleep(1.0)
-        else:
-            raise CommError("Couldn't connect after %d attempts: %s" %
-                        (MAX_RETRIES, fail[0][2]), url)
+        for retry in range(MAX_RETRIES):
+            try:
+                self.init_handle(url)
+                self.perform()
+                x, succ, fail = self.multi.info_read(1)
+                if fail:
+                    raise CommError(fail[0][2], url)
 
-        # make sure all headers are read
-        while self.cont and not self.body:
-            self.perform()
+                # make sure all headers are read
+                while self.cont and not self.body:
+                    self.perform()
 
-        code = self.handle.getinfo(HTTP_CODE)
-        if code == 0:
-            raise CommError("Couldn't receive http response", url)
-        check_code(self.handle, expect, url)
+                code = self.handle.getinfo(HTTP_CODE)
+                if code == 0:
+                    raise CommError("Couldn't receive http response", url)
+                check_code(self.handle, expect, url)
+
+            except CommError, e:
+                if retry == MAX_RETRIES-1:
+                    raise CommError("Couldn't connect after %d attempts: %s" %
+                                    (MAX_RETRIES, e.msg), url)
+                self.handle = Curl()
+                time.sleep(1.0)
+        raise CommError("Connect failed") # shouldn't get here
 
     def init_handle(self, url):
         self.handle.setopt(URL, str(url))
