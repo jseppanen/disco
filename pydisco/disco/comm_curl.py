@@ -78,7 +78,7 @@ class CurlConn:
                 if code == 0:
                     raise CommError("Couldn't receive http response", url)
                 check_code(self.handle, expect, url)
-
+                return
             except CommError, e:
                 if retry == MAX_RETRIES-1:
                     raise CommError("Couldn't connect after %d attempts: %s" %
