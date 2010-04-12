@@ -58,6 +58,7 @@ Utility functions
 
 import os, subprocess, cStringIO, time, sys
 import re, traceback, tempfile, struct, random
+import functools
 from disco import util
 from disco.util import parse_dir, err, data_err, msg, load_oob
 from disco.func import re_reader, netstr_reader
@@ -181,6 +182,14 @@ def close_output(fd_list):
     for fd in reversed(fd_list):
         if hasattr(fd, "close"):
             fd.close()
+
+def get_function(fn):
+    if hasattr(fn, 'func_code'):
+        return fn
+    elif isinstance(fn, functools.partial):
+        return get_function(fn.func)
+    else:
+        raise TypeError('Not a function: %s' % fn)
 
 class MapOutput(object):
     def __init__(self, part, params, combiner = None):
@@ -310,7 +319,9 @@ class ReduceReader(object):
         msg("Reduce done: %d entries reduced in total" % i)
 
     def multi_file_iterator(self, inputs, params, progress = True,
-                reader = fun_reader):
+                reader = None):
+        if reader is None:
+            reader = fun_reader
         i = 0
         for url in inputs:
             fd, sze, url = connect_input(url, params)
@@ -347,22 +358,23 @@ def import_modules(modules):
     mod = [(m, __import__(m, fromlist = [m])) for m in modules]
     for n, m in mod:
         for fun in funcs:
-            fun.func_globals.setdefault(n.split(".")[-1], m)
+            get_function(fun).func_globals.setdefault(n.split(".")[-1], m)
 
 def load_stack(job, mode, inout):
     key = "%s_%s_stream" % (mode, inout)
     stack = [("disco.func.%s" % key, getattr(disco.func, key))]
     if key in job:
-        stack = [(k, util.unpack(v)) for k, v in decode_netstring_str(job[key])]
+        stack = [(k, util.unpack(v, globals=globals()))
+                 for k, v in decode_netstring_str(job[key])]
     for k, fn in stack:
-        fn.func_globals.update(globals())
+        get_function(fn).func_globals.update(globals())
     return stack
 
 def init_common(job):
     global status_interval, input_stream_stack, output_stream_stack
     if 'required_files' in job:
         path = Task.path("REQ_FILES")
-        write_files(util.unpack(job['required_files']), path)
+        write_files(util.unpack(job['required_files'], globals=globals()), path)
         sys.path.insert(0, path)
 
     Task.num_partitions = int(job['nr_reduces'])
@@ -381,13 +393,16 @@ def op_map(job):
         err("Map can only handle one input. Got: %s" %
             " ".join(Task.inputs))
 
-    fun_reader.func_code = util.unpack(job['map_reader']).func_code
-    fun_writer.func_code = util.unpack(job['map_writer']).func_code
-    fun_partition.func_code = util.unpack(job['partition']).func_code
+    global fun_reader, fun_writer, fun_partition
+    fun_reader = util.unpack(job['map_reader'], globals=globals())
+    fun_writer = util.unpack(job['map_writer'], globals=globals())
+    fun_partition = util.unpack(job['partition'], globals=globals())
 
+    global fun_init
     if 'map_init' in job:
-        fun_init.func_code = util.unpack(job['map_init']).func_code
+        fun_init = util.unpack(job['map_init'], globals=globals())
 
+    global fun_map
     if 'ext_map' in job:
         if 'ext_params' in job:
             map_params = job['ext_params']
@@ -396,17 +411,20 @@ def op_map(job):
 
         path = Task.path("EXT_MAP")
         external.prepare(job['ext_map'], map_params, path)
-        fun_map.func_code = external.ext_map.func_code
+        fun_map = external.ext_map
     else:
-        map_params = util.unpack(job['params'])
-        fun_map.func_code = util.unpack(job['map']).func_code
+        map_params = util.unpack(job['params'], globals=globals())
+        fun_map = util.unpack(job['map'], globals=globals())
+
+    global fun_combiner
+    if 'combiner' in job:
+        fun_combiner = util.unpack(job['combiner'], globals=globals())
 
     init_common(job)
 
     nr_part = max(1, Task.num_partitions)
 
     if 'combiner' in job:
-        fun_combiner.func_code = util.unpack(job['combiner']).func_code
         partitions = [MapOutput(i, map_params, fun_combiner)\
             for i in range(nr_part)]
     else:
@@ -430,12 +448,15 @@ def op_reduce(job):
     do_sort = int(job['sort'])
     mem_sort_limit = int(job['mem_sort_limit'])
 
+    global fun_init
     if 'reduce_init' in job:
-        fun_init.func_code = util.unpack(job['reduce_init']).func_code
+        fun_init = util.unpack(job['reduce_init'], globals=globals())
 
-    fun_reader.func_code = util.unpack(job['reduce_reader']).func_code
-    fun_writer.func_code = util.unpack(job['reduce_writer']).func_code
+    global fun_reader, fun_writer
+    fun_reader = util.unpack(job['reduce_reader'], globals=globals())
+    fun_writer = util.unpack(job['reduce_writer'], globals=globals())
 
+    global fun_reduce
     if 'ext_reduce' in job:
         if "ext_params" in job:
             red_params = job['ext_params']
@@ -444,10 +465,10 @@ def op_reduce(job):
 
         path = Task.path("EXT_MAP")
         external.prepare(job['ext_reduce'], red_params, path)
-        fun_reduce.func_code = external.ext_reduce.func_code
+        fun_reduce = external.ext_reduce
     else:
-        fun_reduce.func_code = util.unpack(job['reduce']).func_code
-        red_params = util.unpack(job['params'])
+        fun_reduce = util.unpack(job['reduce'], globals=globals())
+        red_params = util.unpack(job['params'], globals=globals())
 
     init_common(job)
 

@@ -1,4 +1,5 @@
 import re, struct, sys, os, imp, modulefinder
+import functools
 from os.path import abspath, dirname
 from opcode import opname
 
@@ -9,6 +10,8 @@ def user_paths():
 
 
 def parse_function(function):
+    if isinstance(function, functools.partial):
+        return parse_function(function.func)
     code = function.func_code
     mod = re.compile(r'\x%.2x(..)\x%.2x' % (opname.index('LOAD_GLOBAL'),
                         opname.index('LOAD_ATTR')), re.DOTALL)

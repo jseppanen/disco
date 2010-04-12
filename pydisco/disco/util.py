@@ -42,10 +42,10 @@ def rapply(iterable, fn):
             yield fn(item)
 
 def unpickle_partial(func, args, kwargs):
-    return functools.partial(func, *args, **kwargs)
+    return functools.partial(unpack(func), *args, **kwargs)
 
 def pickle_partial(p):
-    return unpickle_partial, (p.func, p.args, p.keywords or {})
+    return unpickle_partial, (pack(p.func), p.args, p.keywords or {})
 
 # support functools.partial also on Pythons prior to 3.1
 if sys.version_info < (3,1):
@@ -58,12 +58,14 @@ def pack(object):
         return marshal.dumps(object.func_code)
     return cPickle.dumps(object, cPickle.HIGHEST_PROTOCOL)
 
-def unpack(string):
+def unpack(string, globals={'__builtins__': __builtins__}):
     try:
         return cPickle.loads(string)
-    except Exception:
-        return FunctionType(marshal.loads(string),
-                            {'__builtins__': __builtins__})
+    except Exception, err:
+        try:
+            return FunctionType(marshal.loads(string), globals)
+        except Exception:
+            raise err
 
 def urlsplit(url):
     scheme, rest = url.split('://', 1) if '://' in url  else ('file', url)
